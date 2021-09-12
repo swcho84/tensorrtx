@@ -5,9 +5,9 @@
 #include "logging.h"
 #include "common.hpp"
 
-// #define USE_FP16  // comment out this if want to use FP16
+#define USE_FP16  // comment out this if want to use FP16, using low-epoch wts (for FP16)
 #define DEVICE 0
-#define CONF_THRESH 0.25
+#define CONF_THRESH 0.35
 #define BATCH_SIZE 1
 #define BILINEAR true
 
@@ -48,7 +48,9 @@ cv::Mat preprocess_img(cv::Mat& img) {
     return out;
 }
 
-
+// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// for making tensorRT-engine
 
 ILayer* doubleConv(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int outch, int ksize, std::string lname, int midch){
     IConvolutionLayer* conv1 = network->addConvolutionNd(input, midch, DimsHW{ksize, ksize}, weightMap[lname + ".double_conv.0.weight"], weightMap[lname + ".double_conv.0.bias"]);
@@ -154,7 +156,7 @@ ICudaEngine* createEngine_l(unsigned int maxBatchSize, IBuilder* builder, IBuild
     ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{ CHANNEL, INPUT_H, INPUT_W });
     assert(data);
 
-    std::map<std::string, Weights> weightMap = loadWeights("/home/drswchorndlaptop/tensorrtx/unet/build/unet_weight_karidb.wts");
+    std::map<std::string, Weights> weightMap = loadWeights("/home/drswchorndlaptop/tensorrtx/unet/build/lastModel.wts");
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
 
     // build network
@@ -213,6 +215,36 @@ void APIToModel(unsigned int maxBatchSize, IHostMemory** modelStream) {
     builder->destroy();
 }
 
+
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// ----------------------------------------------------------------------------------------------------------------------------------------------------------------
+// for tensorrt-based inference
+struct  Detection
+{        
+  float mask[INPUT_W*INPUT_H];
+};
+
+float sigmoid(float x)
+{
+	return (1 / (1 + exp(-x)));
+}
+
+Detection process_cls_result(float *output) 
+{
+	Detection res;
+
+	// channel#1: ground
+	int nClassNum = 1;
+	int j = 0;
+	for(int i = INPUT_W*INPUT_H*(nClassNum - 1); i < (INPUT_W*INPUT_H*(nClassNum)); i++)
+	{
+		res.mask[j] = 1.0 - sigmoid(output[i]);
+		j++;
+	}
+	return res;
+}
+
 void doInference(IExecutionContext& context, cudaStream_t& stream, void **buffers, float* input, float* output, int batchSize) {
     // DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
     CHECK(cudaMemcpyAsync(buffers[0], input, batchSize * CHANNEL * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
@@ -221,163 +253,145 @@ void doInference(IExecutionContext& context, cudaStream_t& stream, void **buffer
     cudaStreamSynchronize(stream);
 }
 
-struct  Detection{        
-    float mask[INPUT_W*INPUT_H];
-    };
-
-float sigmoid(float x)
+int main(int argc, char** argv) 
 {
-    return (1 / (1 + exp(-x)));
+	cudaSetDevice(DEVICE);
+
+	// create a model using the API directly and serialize it to a stream
+	char *trtModelStream{nullptr};
+	size_t size{0};
+	std::string engine_name = "unet.engine";
+
+	// creating the engine file
+	if (argc == 2 && std::string(argv[1]) == "-s") 
+	{
+		IHostMemory* modelStream{nullptr};
+		APIToModel(BATCH_SIZE, &modelStream);
+		assert(modelStream != nullptr);
+
+		std::ofstream p(engine_name, std::ios::binary);
+		if (!p) 
+		{
+			std::cerr << "could not open plan output file" << std::endl;
+			return -1;
+		}
+
+		p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
+		modelStream->destroy();
+		return 0;
+	} 
+	else if (argc == 3 && std::string(argv[1]) == "-d") // inference loop
+	{
+		std::ifstream file(engine_name, std::ios::binary);
+		if (file.good()) 
+		{
+			file.seekg(0, file.end);
+			size = file.tellg();
+			file.seekg(0, file.beg);
+			trtModelStream = new char[size];
+			assert(trtModelStream);
+			file.read(trtModelStream, size);
+			file.close();
+		}
+	} 
+	else 
+	{
+		std::cerr << "arguments not right!" << std::endl;
+		std::cerr << "./unet -s  // serialize model to plan file" << std::endl;
+		std::cerr << "./unet -d ../samples  // deserialize plan file and run inference" << std::endl;
+		return -1;
+	}
+
+	std::vector<std::string> file_names;
+	if (read_files_in_dir(argv[2], file_names) < 0) 
+	{
+		std::cout << "read_files_in_dir failed." << std::endl;
+		return -1;
+	}
+
+	// prepare input data ---------------------------
+	static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
+	static float prob[BATCH_SIZE * OUTPUT_SIZE];
+	IRuntime* runtime = createInferRuntime(gLogger);
+	assert(runtime != nullptr);
+	ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
+	assert(engine != nullptr);
+	IExecutionContext* context = engine->createExecutionContext();
+	assert(context != nullptr);
+	delete[] trtModelStream;
+	assert(engine->getNbBindings() == 2);
+	void* buffers[2];
+
+	// In order to bind the buffers, we need to know the names of the input and output tensors.
+	// Note that indices are guaranteed to be less than IEngine::getNbBindings()
+	const int inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
+	const int outputIndex = engine->getBindingIndex(OUTPUT_BLOB_NAME);
+	assert(inputIndex == 0);
+	assert(outputIndex == 1);
+
+	// Create GPU buffers on device
+	CUDA_CHECK(cudaMalloc(&buffers[inputIndex], BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float)));
+	CUDA_CHECK(cudaMalloc(&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+	
+	// Create stream
+	cudaStream_t stream;
+	CUDA_CHECK(cudaStreamCreate(&stream));
+
+	// main loop, for the single image (ROS/Gazebo simulation)
+	cv::Mat img = cv::imread("/home/drswchorndlaptop/tensorrtx/unet/samples/image.jpg");
+	cv::Mat pr_img = preprocess_img(img); // letterbox BGR to RGB
+	int i = 0;
+	for (int row = 0; row < INPUT_H; ++row) 
+	{
+		uchar* uc_pixel = pr_img.data + row * pr_img.step;
+		for (int col = 0; col < INPUT_W; ++col) 
+		{
+			data[i] = (float)uc_pixel[2] / 255.0;
+			data[i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
+			data[i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
+			uc_pixel += CHANNEL;
+			++i;
+		}
+	}
+
+	// Run inference
+	auto start = std::chrono::system_clock::now();
+	doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
+	auto end = std::chrono::system_clock::now();
+	std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
+
+	// for 3-class in single image
+	Detection detect_res = process_cls_result(prob);
+	std::vector<Detection> batch_res;
+	batch_res.push_back(detect_res);
+	cv::Mat mask_mat = cv::Mat(INPUT_H,INPUT_W,CV_8UC1); 
+	mask_mat.zeros(INPUT_H, INPUT_W, CV_8UC1);
+	for(int i =0; i< INPUT_H ;i++)
+	{
+		uchar *ptmp = mask_mat.ptr<uchar>(i);
+		for(int j=0;j<INPUT_W;j++)
+		{
+			float *pixcel = batch_res[0].mask + i*INPUT_W + j;
+			
+			if(*pixcel > CONF_THRESH)
+				ptmp[j] = 255;
+			else
+				ptmp[j] = 0;
+		}            
+	}
+
+	// saving result
+	cv::imwrite("s_mask_output_unet.jpg", mask_mat); 
+
+	// Destroy the engine
+	// Release stream and buffers
+	cudaStreamDestroy(stream);
+	CHECK(cudaFree(buffers[inputIndex]));
+	CHECK(cudaFree(buffers[outputIndex]));		
+	context->destroy();
+	engine->destroy();
+	runtime->destroy();
+
+	return 0;
 }
 
-void process_cls_result(Detection &res, float *output) {    
-	int j = 0;
-	// channel#1: ground
-	int nClassNum = 1;
-    for(int i = INPUT_W*INPUT_H*(nClassNum - 1); i < (INPUT_W*INPUT_H*(nClassNum)); i++){
-        res.mask[j] = 1.0 - sigmoid(output[i]);
-				printf("res.mask[%d]:%f\n", j, res.mask[j]);
-				j++;
-        }
-    }
-
-int main(int argc, char** argv) {
-    cudaSetDevice(DEVICE);
-    // create a model using the API directly and serialize it to a stream
-    char *trtModelStream{nullptr};
-    size_t size{0};
-    std::string engine_name = "unet.engine";
-    if (argc == 2 && std::string(argv[1]) == "-s") {
-        IHostMemory* modelStream{nullptr};
-        APIToModel(BATCH_SIZE, &modelStream);
-        assert(modelStream != nullptr);
-        std::ofstream p(engine_name, std::ios::binary);
-        if (!p) {
-            std::cerr << "could not open plan output file" << std::endl;
-            return -1;
-        }
-        p.write(reinterpret_cast<const char*>(modelStream->data()), modelStream->size());
-        modelStream->destroy();
-        return 0;
-    } else if (argc == 3 && std::string(argv[1]) == "-d") {
-        std::ifstream file(engine_name, std::ios::binary);
-        if (file.good()) {
-            file.seekg(0, file.end);
-            size = file.tellg();
-            file.seekg(0, file.beg);
-            trtModelStream = new char[size];
-            assert(trtModelStream);
-            file.read(trtModelStream, size);
-            file.close();
-        }
-    } else {
-        std::cerr << "arguments not right!" << std::endl;
-        std::cerr << "./unet -s  // serialize model to plan file" << std::endl;
-        std::cerr << "./unet -d ../samples  // deserialize plan file and run inference" << std::endl;
-        return -1;
-    }
-
-    std::vector<std::string> file_names;
-    if (read_files_in_dir(argv[2], file_names) < 0) {
-        std::cout << "read_files_in_dir failed." << std::endl;
-        return -1;
-    }
-
-    // prepare input data ---------------------------
-    static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    static float prob[BATCH_SIZE * OUTPUT_SIZE];
-    IRuntime* runtime = createInferRuntime(gLogger);
-    assert(runtime != nullptr);
-    ICudaEngine* engine = runtime->deserializeCudaEngine(trtModelStream, size);
-    assert(engine != nullptr);
-    IExecutionContext* context = engine->createExecutionContext();
-    assert(context != nullptr);
-    delete[] trtModelStream;
-    assert(engine->getNbBindings() == 2);
-    void* buffers[2];
-
-    // In order to bind the buffers, we need to know the names of the input and output tensors.
-    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
-    const int inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
-    const int outputIndex = engine->getBindingIndex(OUTPUT_BLOB_NAME);
-    assert(inputIndex == 0);
-    assert(outputIndex == 1);
-    // Create GPU buffers on device
-    CUDA_CHECK(cudaMalloc(&buffers[inputIndex], BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
-    // Create stream
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-
-    int fcount = 0;
-    for (int f = 0; f < (int)file_names.size(); f++) {
-        fcount++;
-        if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
-        for (int b = 0; b < fcount; b++) {
-            cv::Mat img = cv::imread(std::string(argv[2]) + "/" + file_names[f - fcount + 1 + b]);
-            if (img.empty()) continue;
-            cv::Mat pr_img = preprocess_img(img); // letterbox BGR to RGB
-            int i = 0;
-            for (int row = 0; row < INPUT_H; ++row) {
-                uchar* uc_pixel = pr_img.data + row * pr_img.step;
-                for (int col = 0; col < INPUT_W; ++col) {
-                    data[b * CHANNEL * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
-                    data[b * CHANNEL * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
-                    data[b * CHANNEL * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
-                    uc_pixel += CHANNEL;
-                    ++i;
-                }
-            }
-        }
-
-        // Run inference
-        auto start = std::chrono::system_clock::now();
-        doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
-        auto end = std::chrono::system_clock::now();
-        std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-        
-				// for 3-class
-        std::vector<Detection> batch_res(fcount);
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            process_cls_result(res, &prob[b * OUTPUT_SIZE]);
-        }
-
-        std::cout << fcount << std::endl;
-
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-						float *mask = res.mask;
-            cv::Mat mask_mat = cv::Mat(INPUT_H,INPUT_W,CV_8UC1); 
-						mask_mat.zeros(INPUT_H, INPUT_W, CV_8UC1);
-            uchar *ptmp = NULL;
-            for(int i =0; i< INPUT_H ;i++){
-                ptmp = mask_mat.ptr<uchar>(i);
-                for(int j=0;j<INPUT_W;j++){
-                    float * pixcel = mask+i*INPUT_W+j;
-                    std::cout << *pixcel << std::endl;
-                    if(*pixcel > CONF_THRESH){
-                        ptmp[j] = 255;
-                    }
-                    else{
-                        ptmp[j] = 0;
-                    } 
-                }            
-            }
-
-            cv::imwrite("s_mask_" + file_names[f - fcount + 1 + b] + "_unet.jpg", mask_mat); 
-        }
-        fcount = 0;
-    }
-
-    // Destroy the engine
-    // Release stream and buffers
-    cudaStreamDestroy(stream);
-    CHECK(cudaFree(buffers[inputIndex]));
-    CHECK(cudaFree(buffers[outputIndex]));		
-    context->destroy();
-    engine->destroy();
-    runtime->destroy();
-
-    return 0;
-}
