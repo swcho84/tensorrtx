@@ -1,30 +1,61 @@
-#ifndef _DECODE_CU_H
-#define _DECODE_CU_H
+#ifndef _YOLO_LAYER_H
+#define _YOLO_LAYER_H
 
-#include <string>
-#include <vector>
+#include <assert.h>
+#include <cmath>
+#include <string.h>
+#include <cublas_v2.h>
 #include "NvInfer.h"
+#include "Utils.h"
+#include <iostream>
 
-namespace decodeplugin
+namespace Yolo
 {
-    struct alignas(float) Detection{
-        float bbox[4];  //x1 y1 x2 y2
-        float class_confidence;
-        float landmark[10];
+    static constexpr int CHECK_COUNT = 3;
+    static constexpr float IGNORE_THRESH = 0.1f;
+    static constexpr int MAX_OUTPUT_BBOX_COUNT = 1000;
+    static constexpr int CLASS_NUM = 2;
+    static constexpr int INPUT_H = 416;
+    static constexpr int INPUT_W = 416;
+
+    struct YoloKernel
+    {
+        int width;
+        int height;
+        float anchors[CHECK_COUNT*2];
     };
-    static const int INPUT_H = 480;
-    static const int INPUT_W = 640;
+
+    static constexpr YoloKernel yolo1 = {
+        INPUT_W / 32,
+        INPUT_H / 32,
+        {81,82, 135,169, 344,319}
+    };
+    static constexpr YoloKernel yolo2 = {
+        INPUT_W / 16,
+        INPUT_H / 16,
+        {23,27, 37,58, 81,82}
+    };
+
+    static constexpr int LOCATIONS = 4;
+    struct alignas(float) Detection{
+        //x y w h
+        float bbox[LOCATIONS];
+        float det_confidence;
+        float class_id;
+        float class_confidence;
+    };
 }
+
 
 namespace nvinfer1
 {
-    class DecodePlugin: public IPluginV2IOExt
+    class YoloLayerPlugin: public IPluginV2IOExt
     {
         public:
-            DecodePlugin();
-            DecodePlugin(const void* data, size_t length);
+            explicit YoloLayerPlugin();
+            YoloLayerPlugin(const void* data, size_t length);
 
-            ~DecodePlugin();
+            ~YoloLayerPlugin();
 
             int getNbOutputs() const override
             {
@@ -74,19 +105,22 @@ namespace nvinfer1
 
             void detachFromContext() override;
 
-            int input_size_;
         private:
-            void forwardGpu(const float *const * inputs, float* output, cudaStream_t stream, int batchSize = 1);
-            int thread_count_ = 256;
+            void forwardGpu(const float *const * inputs,float * output, cudaStream_t stream,int batchSize = 1);
+            int mClassCount;
+            int mKernelCount;
+            std::vector<Yolo::YoloKernel> mYoloKernel;
+            int mThreadCount = 256;
+            void** mAnchor;
             const char* mPluginNamespace;
     };
 
-    class DecodePluginCreator : public IPluginCreator
+    class YoloPluginCreator : public IPluginCreator
     {
         public:
-            DecodePluginCreator();
+            YoloPluginCreator();
 
-            ~DecodePluginCreator() override = default;
+            ~YoloPluginCreator() override = default;
 
             const char* getPluginName() const override;
 
@@ -113,7 +147,9 @@ namespace nvinfer1
             static PluginFieldCollection mFC;
             static std::vector<PluginField> mPluginAttributes;
     };
-    REGISTER_TENSORRT_PLUGIN(DecodePluginCreator);
+
+
+
 };
 
 #endif 

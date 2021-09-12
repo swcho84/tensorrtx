@@ -1,0 +1,9 @@
+{
+	"files.associations": {
+		"__functional_03": "cpp",
+		"functional": "cpp",
+		"future": "cpp",
+		"iostream": "cpp",
+		"chrono": "cpp"
+	}
+}

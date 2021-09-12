@@ -145,4 +145,14 @@ int read_files_in_dir(const char *p_dir_name, std::vector<std::string> &file_nam
     return 0;
 }
 
+cv::Mat createLTU(int len)
+{
+    cv::Mat lookUpTable(1, 256, CV_8U);
+    uchar *p = lookUpTable.data;
+    for (int j = 0; j < 256; ++j)
+    {
+        p[j] = (j * (256 / len) > 255) ? uchar(255) : (uchar)(j * (256 / len));
+    }
+    return lookUpTable;
+}
 #endif

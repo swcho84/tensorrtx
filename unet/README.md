@@ -1,4 +1,8 @@
 # tensorrt-unet
+
+<img width="793" alt="屏幕截图 2021-05-07 153556" src="https://user-images.githubusercontent.com/13601004/117414645-f7374500-af49-11eb-95ff-b9a685629b23.png">
+original img(left) and segmentation result(right)<br>
+
 This is a TensorRT version Unet, inspired by [tensorrtx](https://github.com/wang-xinyu/tensorrtx) and [pytorch-unet](https://github.com/milesial/Pytorch-UNet).<br>
 You can generate TensorRT engine file using this script and customize some params and network structure based on network you trained (FP32/16 precision, input size, different conv, activation function...)<br>
 
@@ -23,7 +27,7 @@ train your dataset by following [pytorch-unet](https://github.com/milesial/Pytor
 
 ## convert .wts
 
-run gen_wts from utils folder, and move it to project folder<br>
+run gen_wts from utils folder, and move it to project folder (you need to run with east training environment)(<br>
 
 # generate engine file and infer
 
@@ -49,7 +53,7 @@ unet -d ../samples
 ```
 
 # efficiency
-the speed of tensorRT engine is much faster
+the speed of tensorRT engine is much faster（testing on 2080TI）
 
  pytorch | TensorRT FP32 | TensorRT FP16
  ---- | ----- | ------  

@@ -1,7 +1,7 @@
 import struct
 import sys
 from models import *
-from utils.utils import *
+from utils.torch_utils import select_device
 
 model = Darknet('cfg/yolov4.cfg', (608, 608))
 weights = sys.argv[1]

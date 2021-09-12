@@ -1,21 +1,22 @@
 #include <iostream>
 #include <chrono>
 #include "cuda_runtime_api.h"
+#include "cuda_utils.h"
 #include "logging.h"
 #include "common.hpp"
-#define DEVICE 0
-#define NET s  // s m l x
-#define NETSTRUCT(str) createEngine_##str
-#define CREATENET(net) NETSTRUCT(net)
-#define STR1(x) #x
-#define STR2(x) STR1(x)
+
 // #define USE_FP16  // comment out this if want to use FP16
-#define CONF_THRESH 0.5
+#define DEVICE 0
+#define CONF_THRESH 0.25
 #define BATCH_SIZE 1
+#define BILINEAR true
+
 // stuff we know about the network and the input/output blobs
-static const int INPUT_H = 816;
-static const int INPUT_W = 672;
-static const int OUTPUT_SIZE = 672*816;
+static const int INPUT_H = 480;
+static const int INPUT_W = 640;
+static const int CLASSES = 3;  // Pytorch-unet
+static const int CHANNEL = 3;
+static const int OUTPUT_SIZE = INPUT_W*INPUT_H;
 
 const char* INPUT_BLOB_NAME = "data";
 const char* OUTPUT_BLOB_NAME = "prob";
@@ -42,7 +43,7 @@ cv::Mat preprocess_img(cv::Mat& img) {
     }
     cv::Mat re(h, w, CV_8UC3);
     cv::resize(img, re, re.size(), 0, 0, cv::INTER_CUBIC);
-    cv::Mat out(INPUT_H, INPUT_W, CV_8UC3, cv::Scalar(128, 128, 128));
+    cv::Mat out(INPUT_H, INPUT_W, CV_8UC3, cv::Scalar(0, 0, 0));
     re.copyTo(out(cv::Rect(x, y, re.cols, re.rows)));
     return out;
 }
@@ -50,11 +51,6 @@ cv::Mat preprocess_img(cv::Mat& img) {
 
 
 ILayer* doubleConv(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int outch, int ksize, std::string lname, int midch){
-    // Weights emptywts{DataType::kFLOAT, nullptr, 0};
-    // int p = ksize / 2;
-    // if (midch==NULL){
-    //     midch = outch;
-    // }
     IConvolutionLayer* conv1 = network->addConvolutionNd(input, midch, DimsHW{ksize, ksize}, weightMap[lname + ".double_conv.0.weight"], weightMap[lname + ".double_conv.0.bias"]);
     conv1->setStrideNd(DimsHW{1, 1});
     conv1->setPaddingNd(DimsHW{1, 1});
@@ -75,7 +71,7 @@ ILayer* down(INetworkDefinition *network, std::map<std::string, Weights>& weight
     
     IPoolingLayer* pool1 = network->addPoolingNd(input, PoolingType::kMAX, DimsHW{2, 2});
     assert(pool1);
-    ILayer* dcov1 = doubleConv(network,weightMap,*pool1->getOutput(0),outch,3,lname+".maxpool_conv.1",outch);
+    ILayer* dcov1 = doubleConv(network,weightMap,*pool1->getOutput(0),outch,p,lname+".maxpool_conv.1",outch);
     assert(dcov1);
     return dcov1;
 }
@@ -85,43 +81,63 @@ ILayer* up(INetworkDefinition *network, std::map<std::string, Weights>& weightMa
     for (int i = 0; i < resize * 2 * 2; i++) {
         deval[i] = 1.0;
     }
-    Weights emptywts{DataType::kFLOAT, nullptr, 0};
-    Weights deconvwts1{DataType::kFLOAT, deval, resize * 2 * 2};
-    IDeconvolutionLayer* deconv1 = network->addDeconvolutionNd(input1, resize, DimsHW{2, 2}, deconvwts1, emptywts);
-    deconv1->setStrideNd(DimsHW{2, 2});
-    deconv1->setNbGroups(resize);
-    weightMap["deconvwts."+lname] = deconvwts1;
 
-    int diffx = input2.getDimensions().d[1]-deconv1->getOutput(0)->getDimensions().d[1];
-    int diffy = input2.getDimensions().d[2]-deconv1->getOutput(0)->getDimensions().d[2];
-    // IPoolingLayer* pool1 = network->addPooling(dcov1, PoolingType::kMAX, DimsHW{2, 2});
-    // pool1->setStrideNd(DimsHW{2, 2});
-    // dcov1->add_pading
-    ILayer* pad1 = network->addPaddingNd(*deconv1->getOutput(0),DimsHW{diffx / 2, diffy / 2},DimsHW{diffx - (diffx / 2), diffy - (diffy / 2)});
-    // dcov1->setPaddingNd(DimsHW{diffx / 2, diffx - diffx / 2},DimsHW{diffy / 2, diffy - diffy / 2});
-    ITensor* inputTensors[] = {&input2,pad1->getOutput(0)};
-    auto cat = network->addConcatenation(inputTensors, 2);
-    assert(cat);
-    if (midch==64){
-        ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),outch,3,lname+".conv",outch);
-        assert(dcov1);
-        return dcov1;
+    if (BILINEAR){
+        // add upsample bilinear
+        IResizeLayer* deconv1 = network->addResize(input1);
+        auto outdims = input2.getDimensions();
+        deconv1->setOutputDimensions(outdims);
+        deconv1->setResizeMode(ResizeMode::kLINEAR);
+        deconv1->setAlignCorners(true);
+
+        int diffx = input2.getDimensions().d[1]-deconv1->getOutput(0)->getDimensions().d[1];
+        int diffy = input2.getDimensions().d[2]-deconv1->getOutput(0)->getDimensions().d[2];
+
+        ILayer* pad1 = network->addPaddingNd(*deconv1->getOutput(0),DimsHW{diffx / 2, diffy / 2},DimsHW{diffx - (diffx / 2), diffy - (diffy / 2)});
+        ITensor* inputTensors[] = {&input2,pad1->getOutput(0)};
+        auto cat = network->addConcatenation(inputTensors, 2);
+        assert(cat);
+        if (midch==64){
+            ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),outch,3,lname+".conv",outch);
+            assert(dcov1);
+            return dcov1;
+        }else{
+            int midch1 = outch/2;
+            ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),midch1,3,lname+".conv",outch);
+            assert(dcov1);
+            return dcov1;
+        }
     }else{
-        int midch1 = outch/2;
-        ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),midch1,3,lname+".conv",outch);
-        assert(dcov1);
-        return dcov1;
-    }
-    
-    // assert(dcov1);
+        Weights emptywts{DataType::kFLOAT, nullptr, 0};
+        Weights deconvwts1{DataType::kFLOAT, deval, resize * 2 * 2};
+        IDeconvolutionLayer* deconv1 = network->addDeconvolutionNd(input1, resize, DimsHW{2, 2}, deconvwts1, emptywts);
+        deconv1->setStrideNd(DimsHW{2, 2});
+        deconv1->setNbGroups(resize);
+        weightMap["deconvwts."+lname] = deconvwts1;
 
-    // return dcov1;
+        int diffx = input2.getDimensions().d[1]-deconv1->getOutput(0)->getDimensions().d[1];
+        int diffy = input2.getDimensions().d[2]-deconv1->getOutput(0)->getDimensions().d[2];
+
+        ILayer* pad1 = network->addPaddingNd(*deconv1->getOutput(0),DimsHW{diffx / 2, diffy / 2},DimsHW{diffx - (diffx / 2), diffy - (diffy / 2)});
+        ITensor* inputTensors[] = {&input2,pad1->getOutput(0)};
+        auto cat = network->addConcatenation(inputTensors, 2);
+        assert(cat);
+        if (midch==64){
+            ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),outch,3,lname+".conv",outch);
+            assert(dcov1);
+            return dcov1;
+        }else{
+            int midch1 = outch/2;
+            ILayer* dcov1 = doubleConv(network,weightMap,*cat->getOutput(0),midch1,3,lname+".conv",outch);
+            assert(dcov1);
+            return dcov1;
+        }
+    }
 }
 
 ILayer* outConv(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input,  int outch, std::string lname){
-    // Weights emptywts{DataType::kFLOAT, nullptr, 0};
-
-    IConvolutionLayer* conv1 = network->addConvolutionNd(input, 1, DimsHW{1, 1}, weightMap[lname + ".conv.weight"], weightMap[lname + ".conv.bias"]);
+		// important!!!(class:3)
+    IConvolutionLayer* conv1 = network->addConvolutionNd(input, CLASSES, DimsHW{1,1}, weightMap[lname + ".conv.weight"], weightMap[lname + ".conv.bias"]);
     assert(conv1);
     conv1->setStrideNd(DimsHW{1, 1});
     conv1->setPaddingNd(DimsHW{0, 0});
@@ -135,18 +151,18 @@ ICudaEngine* createEngine_l(unsigned int maxBatchSize, IBuilder* builder, IBuild
     INetworkDefinition* network = builder->createNetworkV2(0U);
 
     // Create input tensor of shape {3, INPUT_H, INPUT_W} with name INPUT_BLOB_NAME
-    ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{ 3, INPUT_H, INPUT_W });
+    ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{ CHANNEL, INPUT_H, INPUT_W });
     assert(data);
 
-    std::map<std::string, Weights> weightMap = loadWeights("/home/sycv/workplace/pengyuzhou/tensorrtx/unet/unet_816_672.wts");
+    std::map<std::string, Weights> weightMap = loadWeights("/home/drswchorndlaptop/tensorrtx/unet/build/unet_weight_karidb.wts");
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
 
     // build network
     auto x1 = doubleConv(network,weightMap,*data,64,3,"inc",64);
-    auto x2 = down(network,weightMap,*x1->getOutput(0),128,1,"down1");
-    auto x3 = down(network,weightMap,*x2->getOutput(0),256,1,"down2");
-    auto x4 = down(network,weightMap,*x3->getOutput(0),512,1,"down3");
-    auto x5 = down(network,weightMap,*x4->getOutput(0),512,1,"down4");
+    auto x2 = down(network,weightMap,*x1->getOutput(0),128,3,"down1");
+    auto x3 = down(network,weightMap,*x2->getOutput(0),256,3,"down2");
+    auto x4 = down(network,weightMap,*x3->getOutput(0),512,3,"down3");
+    auto x5 = down(network,weightMap,*x4->getOutput(0),512,3,"down4");
     ILayer* x6 = up(network,weightMap,*x5->getOutput(0),*x4->getOutput(0),512,512,512,"up1");
     ILayer* x7 = up(network,weightMap,*x6->getOutput(0),*x3->getOutput(0),256,256,256,"up2");
     ILayer* x8 = up(network,weightMap,*x7->getOutput(0),*x2->getOutput(0),128,128,128,"up3");
@@ -197,42 +213,16 @@ void APIToModel(unsigned int maxBatchSize, IHostMemory** modelStream) {
     builder->destroy();
 }
 
-void doInference(IExecutionContext& context, float* input, float* output, int batchSize) {
-    const ICudaEngine& engine = context.getEngine();
-
-    // Pointers to input and output device buffers to pass to engine.
-    // Engine requires exactly IEngine::getNbBindings() number of buffers.
-    assert(engine.getNbBindings() == 2);
-    void* buffers[2];
-
-    // In order to bind the buffers, we need to know the names of the input and output tensors.
-    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
-    const int inputIndex = engine.getBindingIndex(INPUT_BLOB_NAME);
-    const int outputIndex = engine.getBindingIndex(OUTPUT_BLOB_NAME);
-
-    // Create GPU buffers on device
-    CHECK(cudaMalloc(&buffers[inputIndex], batchSize * 3 * INPUT_H * INPUT_W * sizeof(float)));
-    CHECK(cudaMalloc(&buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float)));
-
-    // Create stream
-    cudaStream_t stream;
-    CHECK(cudaStreamCreate(&stream));
-
+void doInference(IExecutionContext& context, cudaStream_t& stream, void **buffers, float* input, float* output, int batchSize) {
     // DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
-    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CHECK(cudaMemcpyAsync(buffers[0], input, batchSize * CHANNEL * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
     context.enqueue(batchSize, buffers, stream, nullptr);
-    CHECK(cudaMemcpyAsync(output, buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    //流同步：通过cudaStreamSynchronize()来协调。
+    CHECK(cudaMemcpyAsync(output, buffers[1], batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
     cudaStreamSynchronize(stream);
-
-    // Release stream and buffers
-    cudaStreamDestroy(stream);
-    CHECK(cudaFree(buffers[inputIndex]));
-    CHECK(cudaFree(buffers[outputIndex]));
 }
 
 struct  Detection{        
-    float mask[INPUT_W*INPUT_H*1];
+    float mask[INPUT_W*INPUT_H];
     };
 
 float sigmoid(float x)
@@ -241,8 +231,13 @@ float sigmoid(float x)
 }
 
 void process_cls_result(Detection &res, float *output) {    
-    for(int i=0;i<INPUT_W*INPUT_H*1;i++){
-        res.mask[i] = sigmoid(*(output+i));
+	int j = 0;
+	// channel#1: ground
+	int nClassNum = 1;
+    for(int i = INPUT_W*INPUT_H*(nClassNum - 1); i < (INPUT_W*INPUT_H*(nClassNum)); i++){
+        res.mask[j] = 1.0 - sigmoid(output[i]);
+				printf("res.mask[%d]:%f\n", j, res.mask[j]);
+				j++;
         }
     }
 
@@ -290,8 +285,6 @@ int main(int argc, char** argv) {
 
     // prepare input data ---------------------------
     static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
-    //    data[i] = 1.0;
     static float prob[BATCH_SIZE * OUTPUT_SIZE];
     IRuntime* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
@@ -300,6 +293,21 @@ int main(int argc, char** argv) {
     IExecutionContext* context = engine->createExecutionContext();
     assert(context != nullptr);
     delete[] trtModelStream;
+    assert(engine->getNbBindings() == 2);
+    void* buffers[2];
+
+    // In order to bind the buffers, we need to know the names of the input and output tensors.
+    // Note that indices are guaranteed to be less than IEngine::getNbBindings()
+    const int inputIndex = engine->getBindingIndex(INPUT_BLOB_NAME);
+    const int outputIndex = engine->getBindingIndex(OUTPUT_BLOB_NAME);
+    assert(inputIndex == 0);
+    assert(outputIndex == 1);
+    // Create GPU buffers on device
+    CUDA_CHECK(cudaMalloc(&buffers[inputIndex], BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
+    // Create stream
+    cudaStream_t stream;
+    CUDA_CHECK(cudaStreamCreate(&stream));
 
     int fcount = 0;
     for (int f = 0; f < (int)file_names.size(); f++) {
@@ -309,15 +317,14 @@ int main(int argc, char** argv) {
             cv::Mat img = cv::imread(std::string(argv[2]) + "/" + file_names[f - fcount + 1 + b]);
             if (img.empty()) continue;
             cv::Mat pr_img = preprocess_img(img); // letterbox BGR to RGB
-            // cv::imwrite("s_o" + file_names[f - fcount + 1 + b] + "_unet.jpg", pr_img); 
             int i = 0;
             for (int row = 0; row < INPUT_H; ++row) {
                 uchar* uc_pixel = pr_img.data + row * pr_img.step;
                 for (int col = 0; col < INPUT_W; ++col) {
-                    data[b * 3 * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
-                    uc_pixel += 3;
+                    data[b * CHANNEL * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
+                    data[b * CHANNEL * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
+                    data[b * CHANNEL * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
+                    uc_pixel += CHANNEL;
                     ++i;
                 }
             }
@@ -325,12 +332,11 @@ int main(int argc, char** argv) {
 
         // Run inference
         auto start = std::chrono::system_clock::now();
-        doInference(*context, data, prob, BATCH_SIZE);
+        doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
         auto end = std::chrono::system_clock::now();
         std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-
         
-
+				// for 3-class
         std::vector<Detection> batch_res(fcount);
         for (int b = 0; b < fcount; b++) {
             auto& res = batch_res[b];
@@ -341,29 +347,34 @@ int main(int argc, char** argv) {
 
         for (int b = 0; b < fcount; b++) {
             auto& res = batch_res[b];
-            float * mask = res.mask;
+						float *mask = res.mask;
             cv::Mat mask_mat = cv::Mat(INPUT_H,INPUT_W,CV_8UC1); 
+						mask_mat.zeros(INPUT_H, INPUT_W, CV_8UC1);
             uchar *ptmp = NULL;
             for(int i =0; i< INPUT_H ;i++){
                 ptmp = mask_mat.ptr<uchar>(i);
                 for(int j=0;j<INPUT_W;j++){
                     float * pixcel = mask+i*INPUT_W+j;
-                    // std::cout << *pixcel << std::endl;
+                    std::cout << *pixcel << std::endl;
                     if(*pixcel > CONF_THRESH){
                         ptmp[j] = 255;
                     }
                     else{
-                        ptmp[j]=0;
+                        ptmp[j] = 0;
                     } 
                 }            
             }
 
-            cv::imwrite("s_" + file_names[f - fcount + 1 + b] + "_unet.jpg", mask_mat); 
+            cv::imwrite("s_mask_" + file_names[f - fcount + 1 + b] + "_unet.jpg", mask_mat); 
         }
         fcount = 0;
     }
 
     // Destroy the engine
+    // Release stream and buffers
+    cudaStreamDestroy(stream);
+    CHECK(cudaFree(buffers[inputIndex]));
+    CHECK(cudaFree(buffers[outputIndex]));		
     context->destroy();
     engine->destroy();
     runtime->destroy();
